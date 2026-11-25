@@ -2,8 +2,8 @@ name: Sync upstream
 
 on:
   schedule:
-    # Runs daily at 04:20 Asia/Shanghai (20:20 UTC).
-    - cron: '20 20 * * *'
+    # Runs daily at 08:53 Asia/Shanghai (00:53 UTC).
+    - cron: '53 0 * * *'
   workflow_dispatch:
 
 permissions:
