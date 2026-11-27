@@ -19,6 +19,7 @@ import {
   SSHAESGCMCipher,
   SSHHMAC,
 } from '../ssh/crypto';
+import { SshExecError } from '../ssh/exec-error';
 import {
   assertHostKeyAlgorithm,
   fingerprintHostKey,
@@ -38,6 +39,7 @@ import { ECDHKeyExchange } from '../ssh/kex-ecdh';
 import { KeyDerivation } from '../ssh/keys';
 import { nextSequenceNumber, SSHPacketBuilder, SSHPacketParser } from '../ssh/packet';
 import { SSHTransport } from '../ssh/transport';
+import { concat, encodeString, readUint32 } from '../ssh/utils';
 import type { Env } from '../types';
 import { normalizeResponseDiagnostics, responseErrorDebugMessage } from '../agent-response-diagnostics';
 import { DetachedSessionBuffer } from './ssh-detached-buffer';
@@ -89,7 +91,14 @@ import { detectAndPersistRemoteOS } from './os-detect';
 import { SFTPHandler } from './sftp-handler';
 
 const LOCAL_WINDOW_ADJUST_THRESHOLD = 512 * 1024;
-const KEEPALIVE_REQUEST_NAME = new TextEncoder().encode('keepalive@openssh.com');
+const KEEPALIVE_REQUEST = concat(
+  Uint8Array.of(SSH_MSG_GLOBAL_REQUEST),
+  encodeString('keepalive@openssh.com'),
+  Uint8Array.of(1) // want_reply
+);
+const KEEPALIVE_INTERVAL_MS = 25_000;
+const KEEPALIVE_REPLY_TIMEOUT_MS = 10_000;
+const MAX_KEEPALIVE_FAILURES = 3;
 const MAX_PARTIAL_AUTHENTICATION_STAGES = 8;
 // Socket 写超时（write deadline）：弱网 TCP 半开时 write() 可能永不 settle，
 // 超时即关闭底层 socket 会拒绝所有 pending 写，读循环随之走正常 close() 流程。
@@ -106,6 +115,12 @@ const MAX_SSH_VERSION_PREAMBLE_BYTES = 64 * 1024;
 const MAX_SSH_IDENTIFICATION_BYTES = 255; // RFC 4253 §4.2, including CRLF.
 
 type ActiveAuthMethod = 'none' | 'password' | 'publickey' | 'keyboard-interactive';
+
+interface KeepaliveProbe {
+  sequence: number | null; // null while queued: no reply can belong to this probe yet.
+  sentAt: number;
+  timeout?: ReturnType<typeof setTimeout>;
+}
 
 /** Browser sockets and headless operation sinks share only lifecycle notifications. */
 export type SSHSessionClient = Pick<WebSocket, 'send' | 'close' | 'readyState'>;
@@ -223,11 +238,8 @@ export class SSHSession {
   private negotiatedMacS2C: string = 'none';
 
   private keepaliveInterval: ReturnType<typeof setInterval> | null = null;
-  private keepaliveFailCount: number = 0;
-  private readonly maxKeepaliveFails: number = 3;
-  private keepalivePending: boolean = false;
-  private keepaliveTimeout: ReturnType<typeof setTimeout> | null = null;
-  private keepaliveSentAt: number | null = null;
+  private keepaliveFailCount = 0;
+  private keepaliveProbe: KeepaliveProbe | null = null;
   private colo: string = 'UNKNOWN';
   private readonly onRttUpdated?: (latency: number, colo: string) => void;
   private lastPacketAt: number = Date.now();
@@ -767,30 +779,27 @@ export class SSHSession {
       this.close(true);
       return;
     }
-    if (
-      msgType === SSH_MSG_IGNORE ||
-      msgType === SSH_MSG_DEBUG ||
-      msgType === SSH_MSG_UNIMPLEMENTED
-    ) {
-      return;
-    }
+    if (msgType === SSH_MSG_IGNORE || msgType === SSH_MSG_DEBUG) return;
     if (msgType === SSH_MSG_GLOBAL_REQUEST) {
       await this.handleGlobalRequest(packet.payload);
       return;
     }
-    if (msgType === SSH_MSG_REQUEST_SUCCESS || msgType === SSH_MSG_REQUEST_FAILURE) {
-      // Response to our global request (e.g., keepalive)
-      if (this.keepalivePending && this.keepaliveSentAt !== null) {
-        const latency = Math.round(performance.now() - this.keepaliveSentAt);
-        this.keepaliveSentAt = null;
-        this.emitKeepaliveRtt(latency);
+    if (
+      msgType === SSH_MSG_REQUEST_SUCCESS ||
+      msgType === SSH_MSG_REQUEST_FAILURE ||
+      msgType === SSH_MSG_UNIMPLEMENTED
+    ) {
+      const probe = this.keepaliveProbe;
+      if (!probe || probe.sequence === null) return;
+      // Keepalive is our only outbound global request expecting a reply (81/82).
+      // RouterOS may reject the packet itself instead (RFC 4253 §11.4).
+      if (msgType === SSH_MSG_UNIMPLEMENTED) {
+        if (packet.payload.length !== 5 || readUint32(packet.payload, 1) !== probe.sequence) return;
+        this.sendDebug(() => `Keepalive UNIMPLEMENTED matched seq=${probe.sequence}`);
       }
-      this.keepalivePending = false;
+      this.clearKeepaliveProbe();
       this.keepaliveFailCount = 0;
-      if (this.keepaliveTimeout) {
-        clearTimeout(this.keepaliveTimeout);
-        this.keepaliveTimeout = null;
-      }
+      this.emitKeepaliveRtt(Math.round(performance.now() - probe.sentAt));
       return;
     }
 
@@ -868,59 +877,53 @@ export class SSHSession {
   }
 
   private startKeepalive(): void {
-    this.keepaliveFailCount = 0;
-    this.keepalivePending = false;
+    if (this.closed || this.keepaliveInterval !== null) return;
     this.startIdleWatchdog();
-    this.keepaliveInterval = setInterval(async () => {
-      if (this.keepalivePending) {
-        this.keepaliveFailCount++;
-        this.sendDebug(`Keepalive timeout (${this.keepaliveFailCount}/${this.maxKeepaliveFails})`);
-        if (this.keepaliveFailCount >= this.maxKeepaliveFails) {
-          this.sendError('SSH 连接超时，保活失败', 'keepalive_timeout');
-          this.close();
-          return;
+    this.keepaliveInterval = setInterval(() => void this.sendKeepalive(), KEEPALIVE_INTERVAL_MS);
+  }
+
+  private async sendKeepalive(): Promise<void> {
+    if (this.closed || this.keepaliveProbe) return;
+    const probe: KeepaliveProbe = { sequence: null, sentAt: 0 };
+    this.keepaliveProbe = probe;
+    try {
+      await this.sendEncryptedPacket(
+        () => this.buildEncryptedPacket(KEEPALIVE_REQUEST),
+        (sequence) => {
+          probe.sequence = sequence;
+          probe.sentAt = performance.now();
         }
-      }
+      );
+    } catch {
+      this.failKeepalive(probe, 'send failed');
+      return;
+    }
+    // A fast reply (or close) may already have consumed this probe during write().
+    if (this.keepaliveProbe === probe) {
+      probe.timeout = setTimeout(
+        () => this.failKeepalive(probe, 'response timeout'),
+        KEEPALIVE_REPLY_TIMEOUT_MS
+      );
+    }
+  }
 
-      try {
-        const payload = new Uint8Array(1 + 4 + KEEPALIVE_REQUEST_NAME.length + 1);
-        payload[0] = SSH_MSG_GLOBAL_REQUEST;
-        new DataView(payload.buffer).setUint32(1, KEEPALIVE_REQUEST_NAME.length, false);
-        payload.set(KEEPALIVE_REQUEST_NAME, 5);
-        payload[5 + KEEPALIVE_REQUEST_NAME.length] = 1; // want_reply = true
+  private clearKeepaliveProbe(): void {
+    const probe = this.keepaliveProbe;
+    if (probe?.timeout !== undefined) clearTimeout(probe.timeout);
+    this.keepaliveProbe = null;
+  }
 
-        this.keepaliveSentAt = performance.now();
-        await this.sendEncrypted(payload);
-        this.keepalivePending = true;
-
-        if (this.keepaliveTimeout) clearTimeout(this.keepaliveTimeout);
-        this.keepaliveTimeout = setTimeout(() => {
-          if (this.keepalivePending) {
-            this.keepaliveFailCount++;
-            this.sendDebug(
-              `Keepalive response timeout (${this.keepaliveFailCount}/${this.maxKeepaliveFails})`
-            );
-            this.keepalivePending = false;
-            this.keepaliveSentAt = null;
-            if (this.keepaliveFailCount >= this.maxKeepaliveFails) {
-              this.sendError('SSH 连接超时，保活失败', 'keepalive_timeout');
-              this.close();
-            }
-          }
-        }, 10000);
-      } catch (e) {
-        this.keepaliveFailCount++;
-        this.keepalivePending = false;
-        this.keepaliveSentAt = null;
-        this.sendDebug(
-          `Keepalive send failed (${this.keepaliveFailCount}/${this.maxKeepaliveFails}): ${e instanceof Error ? e.message : String(e)}`
-        );
-        if (this.keepaliveFailCount >= this.maxKeepaliveFails) {
-          this.sendError('SSH 连接超时，保活失败', 'keepalive_timeout');
-          this.close();
-        }
-      }
-    }, 25000);
+  private failKeepalive(probe: KeepaliveProbe, reason: 'response timeout' | 'send failed'): void {
+    if (this.keepaliveProbe !== probe) return;
+    this.clearKeepaliveProbe();
+    this.keepaliveFailCount++;
+    this.sendDebug(
+      () => `Keepalive ${reason} (${this.keepaliveFailCount}/${MAX_KEEPALIVE_FAILURES})`
+    );
+    if (this.keepaliveFailCount >= MAX_KEEPALIVE_FAILURES) {
+      this.sendError('SSH 连接超时，保活失败', 'keepalive_timeout');
+      this.close();
+    }
   }
 
   /**
@@ -1840,15 +1843,9 @@ export class SSHSession {
           this.sendSFTPError('init', `服务器不支持 SFTP: ${description}`);
           this.sftpHandler = null;
         } else if (this.isExecChannel(channelID)) {
-          // Exec channel open failed - reject just this command, keep SSH session alive
-          const execCh = this.activeExecChannels.get(channelID);
-          if (execCh) {
-            execCh.onChannelOpenFailure(reasonCode, description);
-            this.activeExecChannels.delete(channelID);
-          }
-          this.sendDebug(
-            `Exec channel open failed: channelID=${channelID}, reason=${reasonCode}, desc=${description}`
-          );
+          // Exec channel open failed - reject just this command, keep SSH session alive.
+          this.activeExecChannels.get(channelID)?.onChannelOpenFailure();
+          this.sendDebug(`Exec channel open failed: channelID=${channelID}, reason=${reasonCode}`);
         } else {
           // Shell channel failed - close connection
           this.sendError('通道打开被拒绝', 'channel_rejected');
@@ -1902,12 +1899,7 @@ export class SSHSession {
             }
           });
         } else {
-          // Exec channel success — could be exec request confirmed or exit-status
-          // Try to parse exit-status from payload
-          const execCh = this.activeExecChannels.get(channelID);
-          if (execCh) {
-            this.sendDebug(`Exec channel success: channelID=${channelID}`);
-          }
+          this.activeExecChannels.get(channelID)?.onRequestSuccess();
         }
         break;
       }
@@ -1926,7 +1918,12 @@ export class SSHSession {
           this.sendSFTPError('init', 'SFTP subsystem 请求被拒绝');
           this.sftpHandler.dispose();
           this.sftpHandler = null;
-        } else if (this.state === 'shell' || this.state === 'shell-requested') {
+        } else if (this.activeExecChannels.has(channelID)) {
+          this.activeExecChannels.get(channelID)?.onRequestFailure();
+        } else if (
+          channelID === this.shellChannel.getLocalChannelID() &&
+          (this.state === 'shell' || this.state === 'shell-requested')
+        ) {
           this.sendError('PTY 或 Shell 请求被拒绝', 'pty_shell_rejected');
           this.close();
         }
@@ -2144,12 +2141,8 @@ export class SSHSession {
 
         if (reqType === 'exit-status') {
           const execCh = this.activeExecChannels.get(reqChannelID);
-          if (execCh) {
-            const exitCode =
-              (payload[offset] << 24) |
-              (payload[offset + 1] << 16) |
-              (payload[offset + 2] << 8) |
-              payload[offset + 3];
+          if (execCh && payload.length - offset >= 4) {
+            const exitCode = readUint32(payload, offset);
             execCh.onExitStatus(exitCode);
             this.sendDebug(
               `Exec channel exit-status: channelID=${reqChannelID}, exitCode=${exitCode}`
@@ -2740,25 +2733,26 @@ export class SSHSession {
     await this.sendEncryptedPacket(() => this.buildEncryptedChannelDataPacket(chunk, channel));
   }
 
-  private async sendEncryptedPacket(buildPacket: () => Promise<Uint8Array>): Promise<void> {
+  private async sendEncryptedPacket(
+    buildPacket: () => Promise<Uint8Array>,
+    beforeWrite?: (sequence: number) => void
+  ): Promise<void> {
     this.sendMutexPendingCount++;
     const operation = this.sendMutex.then(async () => {
+      if (this.closed) throw new Error('SSH session closed');
+      // Capture the builder's actual uint32 sequence under the shared send lock,
+      // not at enqueue time or after write() (other packets / fast replies).
+      const sequence = this.seqNumSend;
       const encrypted = await buildPacket();
+      if (this.closed) throw new Error('SSH session closed');
+      beforeWrite?.(sequence);
       await this.writeSocket(encrypted);
     });
 
-    this.sendMutex = operation.then(
-      () => {
-        if (--this.sendMutexPendingCount === 0) {
-          this.sendMutex = Promise.resolve();
-        }
-      },
-      () => {
-        if (--this.sendMutexPendingCount === 0) {
-          this.sendMutex = Promise.resolve();
-        }
-      }
-    );
+    const release = () => {
+      if (--this.sendMutexPendingCount === 0) this.sendMutex = Promise.resolve();
+    };
+    this.sendMutex = operation.then(release, release);
     await operation;
   }
 
@@ -3143,34 +3137,60 @@ export class SSHSession {
 
   /** Shared, bounded non-PTY exec. Approval belongs to the calling interface. */
   async executeCommand(command: string, timeout: number, signal?: AbortSignal): Promise<import('./agent/types').ExecResult> {
-    if (this.closed || !['ready', 'tunnel-ready', 'rekey'].includes(this.state)) throw new Error('SSH unavailable');
-    signal?.throwIfAborted();
+    if (!this.isOperational()) {
+      throw new SshExecError(this.closed ? 'exec_transport_closed' : 'exec_failed', 'not_executed');
+    }
+    if (signal?.aborted) throw new SshExecError('exec_cancelled', 'not_executed');
     this.recordUserActivity();
     const channelID = this.nextChannelID++;
     const channel = new SSHChannel(this.channelMaxPacketSize);
-    const execCh = new AgentExecChannel(channelID, channel);
+    const execCh = new AgentExecChannel();
     this.channels.set(channelID, channel);
     this.activeExecChannels.set(channelID, execCh);
     let timer: ReturnType<typeof setTimeout> | undefined;
-    let rejectAbort: ((error: Error) => void) | undefined;
-    const onAbort = () => rejectAbort?.(new Error('Exec aborted'));
-    const cancelled = new Promise<never>((_, reject) => {
-      rejectAbort = reject;
-      timer = setTimeout(() => reject(new Error('Exec timeout')), timeout);
-      signal?.addEventListener('abort', onAbort, { once: true });
-    });
+    let openTimer: ReturnType<typeof setTimeout> | undefined;
+    let rejectStop!: (error: SshExecError) => void;
+    let stopped: SshExecError | undefined;
+    let requestStarted = false;
+    const outcome = () => requestStarted ? 'unknown' : 'not_executed';
+    const stop = (error: SshExecError) => {
+      if (stopped) return;
+      stopped = error;
+      rejectStop(error);
+    };
+    const onAbort = () => stop(new SshExecError('exec_cancelled', outcome()));
+    const cancelled = new Promise<never>((_, reject) => { rejectStop = reject; });
+    timer = setTimeout(() => stop(new SshExecError(
+      requestStarted ? 'exec_timeout' : 'exec_channel_timeout', outcome()
+    )), timeout);
+    openTimer = setTimeout(() => stop(new SshExecError('exec_channel_timeout', 'not_executed')), 5000);
+    signal?.addEventListener('abort', onAbort, { once: true });
     const work = (async () => {
       await this.sendEncrypted(channel.buildOpenSession(channelID));
-      const opened = await this.waitForExecChannelOpen(execCh, channel, '');
-      if (!opened) return execCh.getClosedPromise();
-      signal?.throwIfAborted();
-      if (this.closed || !this.activeExecChannels.has(channelID)) throw new Error('Exec cancelled');
+      const opened = await execCh.getOpenedPromise();
+      clearTimeout(openTimer);
+      if (stopped) throw stopped;
+      if (execCh.isOpenFailed()) throw new SshExecError('exec_channel_rejected', 'not_executed');
+      if (this.closed) throw new SshExecError('exec_transport_closed', 'not_executed');
+      if (!opened || !execCh.startExecRequest()) {
+        throw new SshExecError('exec_channel_closed', 'not_executed');
+      }
+      // Once a write is attempted, neither a write error nor cancellation proves non-execution.
+      requestStarted = true;
       await this.sendEncrypted(channel.buildExecRequest(command));
-      return execCh.getClosedPromise();
+      const result = await execCh.getClosedPromise();
+      if (execCh.wasRequestRejected()) throw new SshExecError('exec_rejected', 'not_executed');
+      if (this.closed && result.exitCode < 0) throw new SshExecError('exec_transport_closed', 'unknown');
+      return result;
     })();
-    try { return await Promise.race([work, cancelled]); }
-    finally {
-      if (timer !== undefined) clearTimeout(timer);
+    try {
+      return await Promise.race([work, cancelled]);
+    } catch (error) {
+      if (error instanceof SshExecError) throw error;
+      throw new SshExecError(this.closed ? 'exec_transport_closed' : 'exec_failed', outcome());
+    } finally {
+      clearTimeout(timer);
+      clearTimeout(openTimer);
       signal?.removeEventListener('abort', onAbort);
       this.activeExecChannels.delete(channelID);
       this.channels.delete(channelID);
@@ -3180,42 +3200,6 @@ export class SSHSession {
         try { await this.sendEncrypted(channel.buildClose()); } catch { /* transport closing */ }
       }
     }
-  }
-
-  private waitForExecChannelOpen(
-    execCh: AgentExecChannel,
-    channel: SSHChannel,
-    command: string
-  ): Promise<boolean> {
-    return new Promise((resolve, reject) => {
-      const start = Date.now();
-      const timeout = 5000;
-
-      const check = () => {
-        if (this.closed || !this.activeExecChannels.has(execCh.getChannelID())) { resolve(false); return; }
-        // Open rejected by server — return false, caller will await closedPromise
-        if (execCh.isOpenFailed()) {
-          resolve(false);
-          return;
-        }
-
-        // Open succeeded — return true, caller will send exec request
-        if (execCh.isOpenConfirmed() || channel.getRemoteChannelID() !== 0) {
-          resolve(true);
-          return;
-        }
-
-        // Timeout — reject with error
-        if (Date.now() - start > timeout) {
-          reject(new Error(`Exec channel open timeout (5s) for command: ${command}`));
-          return;
-        }
-
-        setTimeout(check, 50);
-      };
-
-      check();
-    });
   }
 
   /** Waiting is not active execution: user inactivity continues to expire it. */
@@ -3498,12 +3482,7 @@ export class SSHSession {
       clearInterval(this.keepaliveInterval);
       this.keepaliveInterval = null;
     }
-    if (this.keepaliveTimeout) {
-      clearTimeout(this.keepaliveTimeout);
-      this.keepaliveTimeout = null;
-    }
-    this.keepalivePending = false;
-    this.keepaliveSentAt = null;
+    this.clearKeepaliveProbe();
     if (this.idleWatchdogInterval) {
       clearInterval(this.idleWatchdogInterval);
       this.idleWatchdogInterval = null;
@@ -3552,8 +3531,8 @@ export class SSHSession {
     this.channelDataQueueBytes = 0;
     this.isRekeying = false;
     this.rekeyWaiters = [];
+    // In-flight and queued writes release their own slots as they settle.
     this.sendMutex = Promise.resolve();
-    this.sendMutexPendingCount = 0;
     try {
       this.socketWriter?.releaseLock();
     } catch (e) {
