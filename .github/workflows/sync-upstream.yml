@@ -26,7 +26,7 @@ jobs:
     steps:
       - name: Sync main branch from upstream
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
           REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
